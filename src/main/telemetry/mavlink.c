@@ -44,11 +44,15 @@
 #include "pg/rx.h"
 
 #include "drivers/accgyro/accgyro.h"
+#include "drivers/motor.h"
 #include "drivers/sensor.h"
+#include "drivers/system.h"
 #include "drivers/time.h"
 
 #include "config/config.h"
+#include "fc/core.h"
 #include "fc/rc_controls.h"
+#include "fc/rc_modes.h"
 #include "fc/runtime_config.h"
 
 #include "flight/flight_plan_nav.h"
@@ -59,6 +63,7 @@
 #include "flight/position.h"
 
 #include "io/serial.h"
+#include "io/serial_feature_map.h"
 #include "io/gimbal.h"
 #include "io/gps.h"
 #include "io/ledstrip.h"
@@ -74,6 +79,16 @@
 #include "sensors/battery.h"
 
 #include "telemetry/telemetry.h"
+
+// mavlink library uses unnamed unions that causes GCC to complain if -Wpedantic is used
+// until this is resolved in mavlink library - ignore -Wpedantic for mavlink code.
+// Included before telemetry/mavlink.h so its forward-typedef of mavlink_message_t
+// yields to the real (identical) one rather than clashing.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#include "common/mavlink.h"
+#pragma GCC diagnostic pop
+
 #include "telemetry/mavlink.h"
 #if ENABLE_TELEMETRY_MAVLINK_MISSION
 #include "telemetry/mavlink_mission.h"
@@ -81,13 +96,6 @@
 
 #include "build/debug.h"
 #include "build/version.h"
-
-// mavlink library uses unnamed unions that causes GCC to complain if -Wpedantic is used
-// until this is resolved in mavlink library - ignore -Wpedantic for mavlink code
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#include "common/mavlink.h"
-#pragma GCC diagnostic pop
 
 #define TELEMETRY_MAVLINK_INITIAL_PORT_MODE MODE_RXTX
 #define TELEMETRY_MAVLINK_MAXRATE 50
@@ -98,7 +106,7 @@
 extern uint16_t rssi; // FIXME dependency on mw.c
 
 static serialPort_t *mavlinkPort = NULL;
-static const serialPortConfig_t *portConfig;
+static serialPortIdentifier_e telemetryPort = SERIAL_PORT_NONE;
 
 static bool mavlinkTelemetryEnabled =  false;
 static portSharing_e mavlinkPortSharing;
@@ -129,6 +137,9 @@ typedef struct {
     uint8_t standardMode;
     uint32_t properties;
 } bfMavModeDescriptor_t;
+
+// The mode set is fixed at build time, so its sequence number never changes
+#define BF_MAV_MODES_SEQ 1
 
 static const bfMavModeDescriptor_t bfMavModeDescriptors[BF_MAV_MODE_COUNT] = {
     [BF_MAV_MODE_ACRO]      = { "Acro",      MAV_STANDARD_MODE_NON_STANDARD,  0 },
@@ -173,8 +184,11 @@ static int16_t headingOrScaledMilliAmpereHoursDrawn(void)
 
 static void mavlinkSendStatusText(uint8_t severity, const char *text)
 {
+    // The packer copies the whole field width, so pad short strings out to it
+    char textField[MAVLINK_MSG_STATUSTEXT_FIELD_TEXT_LEN];
+    strncpy(textField, text, sizeof(textField));
     mavlink_msg_statustext_pack(MAVLINK_SYSTEM_ID, MAVLINK_COMPONENT_ID, &mavMsg,
-        severity, text, 0, 0);
+        severity, textField, 0, 0);
     const uint16_t msgLength = mavlink_msg_to_send_buffer(mavBuffer, &mavMsg);
     mavlinkSerialWrite(mavBuffer, msgLength);
 }
@@ -337,7 +351,7 @@ static void mavlinkSendProtocolVersion(void)
 static void mavlinkSendComponentInformation(void)
 {
     mavlink_msg_component_information_pack(MAVLINK_SYSTEM_ID, MAVLINK_COMPONENT_ID, &mavMsg,
-        millis(), 0, "", 0, "");
+        millis(), 0, NULL, 0, NULL); // NULL zero-fills the URI fields
     const uint16_t msgLength = mavlink_msg_to_send_buffer(mavBuffer, &mavMsg);
     mavlinkSerialWrite(mavBuffer, msgLength);
 }
@@ -375,6 +389,9 @@ static void mavlinkSendAvailableMode(uint8_t modeIndex)
     }
     const uint8_t idx0 = modeIndex - 1;
     const bfMavModeDescriptor_t *desc = &bfMavModeDescriptors[idx0];
+    // The packer copies the whole field width, so pad the name out to it
+    char modeName[MAVLINK_MSG_AVAILABLE_MODES_FIELD_MODE_NAME_LEN];
+    strncpy(modeName, desc->name, sizeof(modeName));
 
     mavlink_msg_available_modes_pack(MAVLINK_SYSTEM_ID, MAVLINK_COMPONENT_ID, &mavMsg,
         BF_MAV_MODE_COUNT,
@@ -382,14 +399,15 @@ static void mavlinkSendAvailableMode(uint8_t modeIndex)
         desc->standardMode,
         idx0,
         desc->properties,
-        desc->name);
+        modeName,
+        BF_MAV_MODES_SEQ);
     const uint16_t msgLength = mavlink_msg_to_send_buffer(mavBuffer, &mavMsg);
     mavlinkSerialWrite(mavBuffer, msgLength);
 }
 
 static void mavlinkSendAvailableModesMonitor(void)
 {
-    mavlink_msg_available_modes_monitor_pack(MAVLINK_SYSTEM_ID, MAVLINK_COMPONENT_ID, &mavMsg, 1);
+    mavlink_msg_available_modes_monitor_pack(MAVLINK_SYSTEM_ID, MAVLINK_COMPONENT_ID, &mavMsg, BF_MAV_MODES_SEQ);
     const uint16_t msgLength = mavlink_msg_to_send_buffer(mavBuffer, &mavMsg);
     mavlinkSerialWrite(mavBuffer, msgLength);
 }
@@ -498,6 +516,205 @@ static void handleSetMessageInterval(const mavlink_command_long_t *cmd, uint8_t 
     mavlinkSendCommandAck(cmd->command, success ? MAV_RESULT_ACCEPTED : MAV_RESULT_DENIED, targetSystem, targetComponent);
 }
 
+#if ENABLE_TELEMETRY_MAVLINK_COMMANDS
+// Reboot is deferred until after the COMMAND_ACK has been flushed, so the GCS
+// receives the acknowledgement before the link drops.
+static bool mavlinkRebootPending = false;
+static bool mavlinkRebootToBootloader = false;
+
+// Map a Betaflight custom_mode (bfMavMode_e) onto the box-mode override. ACRO
+// clears the override (manual flight); every other selectable mode forces exactly
+// one box active. Returns false for non-selectable / unknown modes.
+static bool applyMavCustomMode(uint32_t customMode)
+{
+    // Resolve the target box first: a rejected mode must leave any active
+    // override (e.g. an in-progress GPS Rescue) untouched.
+    boxId_e box;
+    switch ((bfMavMode_e)customMode) {
+    case BF_MAV_MODE_ACRO:
+        rcModeClearExternalOverrides();
+        return true;
+    case BF_MAV_MODE_ANGLE:
+        box = BOXANGLE;
+        break;
+    case BF_MAV_MODE_HORIZON:
+        box = BOXHORIZON;
+        break;
+    case BF_MAV_MODE_ALT_HOLD:
+        box = BOXALTHOLD;
+        break;
+    case BF_MAV_MODE_POS_HOLD:
+        box = BOXPOSHOLD;
+        break;
+    case BF_MAV_MODE_AUTOPILOT:
+        box = BOXAUTOPILOT;
+        break;
+    case BF_MAV_MODE_RTL:
+        box = BOXGPSRESCUE;
+        break;
+    case BF_MAV_MODE_FAILSAFE:
+    default:
+        return false;
+    }
+
+    rcModeClearExternalOverrides();
+    rcModeSetExternalOverride(box, true);
+    return true;
+}
+
+static uint8_t handleArmDisarm(float param1)
+{
+    uint32_t arm;
+    if (!cmdParamToUint32(param1, 1, &arm)) {
+        return MAV_RESULT_DENIED;
+    }
+
+    if (arm == 0) {
+        // Disarm is always honoured.
+        disarm(DISARM_REASON_SERIAL_COMMAND);
+        return MAV_RESULT_ACCEPTED;
+    }
+
+#if ENABLE_REMOTE_ARM
+    if (ARMING_FLAG(ARMED)) {
+        return MAV_RESULT_ACCEPTED;
+    }
+    if (isArmingDisabled()) {
+        return MAV_RESULT_TEMPORARILY_REJECTED;
+    }
+    // Routes through the normal arming path — every arming-disable guard applies.
+    tryArm();
+    return ARMING_FLAG(ARMED) ? MAV_RESULT_ACCEPTED : MAV_RESULT_TEMPORARILY_REJECTED;
+#else
+    // Remote arming is opt-in at compile time (ENABLE_REMOTE_ARM).
+    return MAV_RESULT_UNSUPPORTED;
+#endif
+}
+
+static uint8_t handleSetMode(float baseModeF, float customModeF)
+{
+    uint32_t baseMode, customMode;
+    if (!cmdParamToUint32(baseModeF, 0xFF, &baseMode) ||
+        !cmdParamToUint32(customModeF, BF_MAV_MODE_COUNT - 1, &customMode)) {
+        return MAV_RESULT_DENIED;
+    }
+    // We only support selecting a Betaflight mode via custom_mode.
+    if (!(baseMode & MAV_MODE_FLAG_CUSTOM_MODE_ENABLED)) {
+        return MAV_RESULT_DENIED;
+    }
+    return applyMavCustomMode(customMode) ? MAV_RESULT_ACCEPTED : MAV_RESULT_DENIED;
+}
+
+static uint8_t handleReturnToLaunch(void)
+{
+    if (!ARMING_FLAG(ARMED)) {
+        return MAV_RESULT_TEMPORARILY_REJECTED;
+    }
+    rcModeClearExternalOverrides();
+    rcModeSetExternalOverride(BOXGPSRESCUE, true);
+    return MAV_RESULT_ACCEPTED;
+}
+
+static uint8_t handleSetHome(float useCurrentF, bool coordsValid, int32_t lat1e7, int32_t lon1e7, int32_t altCm)
+{
+#ifdef USE_GPS
+    uint32_t useCurrent;
+    if (!cmdParamToUint32(useCurrentF, 1, &useCurrent)) {
+        return MAV_RESULT_DENIED;
+    }
+
+    if (useCurrent) {
+        if (!STATE(GPS_FIX)) {
+            return MAV_RESULT_TEMPORARILY_REJECTED;
+        }
+        GPS_reset_home_position();
+        return MAV_RESULT_ACCEPTED;
+    }
+
+    if (!coordsValid || (lat1e7 == 0 && lon1e7 == 0)) {
+        return MAV_RESULT_DENIED;
+    }
+    GPS_home_llh.lat = constrain(lat1e7, -900000000, 900000000);
+    GPS_home_llh.lon = constrain(lon1e7, -1800000000, 1800000000);
+    GPS_home_llh.altCm = altCm;
+    ENABLE_STATE(GPS_FIX_HOME);
+    return MAV_RESULT_ACCEPTED;
+#else
+    UNUSED(useCurrentF);
+    UNUSED(coordsValid);
+    UNUSED(lat1e7);
+    UNUSED(lon1e7);
+    UNUSED(altCm);
+    return MAV_RESULT_UNSUPPORTED;
+#endif
+}
+
+static uint8_t handleRebootShutdown(float param1)
+{
+    // Refuse to reboot while armed.
+    if (ARMING_FLAG(ARMED)) {
+        return MAV_RESULT_TEMPORARILY_REJECTED;
+    }
+
+    uint32_t action;
+    if (!cmdParamToUint32(param1, 3, &action)) {
+        return MAV_RESULT_DENIED;
+    }
+
+    switch (action) {
+    case 0:  // do nothing
+        return MAV_RESULT_ACCEPTED;
+    case 1:  // reboot autopilot
+        mavlinkRebootToBootloader = false;
+        mavlinkRebootPending = true;
+        return MAV_RESULT_ACCEPTED;
+    case 3:  // reboot autopilot and keep it in the bootloader
+        mavlinkRebootToBootloader = true;
+        mavlinkRebootPending = true;
+        return MAV_RESULT_ACCEPTED;
+    default:
+        return MAV_RESULT_UNSUPPORTED;
+    }
+}
+
+// Shared command executor for COMMAND_LONG and COMMAND_INT. Coordinate-bearing
+// commands receive lat/lon in 1e7 degrees and altitude in cm via coordsValid.
+static uint8_t mavlinkExecCommand(uint16_t command, float param1, float param2,
+    bool coordsValid, int32_t lat1e7, int32_t lon1e7, int32_t altCm)
+{
+    switch (command) {
+    case MAV_CMD_COMPONENT_ARM_DISARM:
+        return handleArmDisarm(param1);
+    case MAV_CMD_DO_SET_MODE:
+        return handleSetMode(param1, param2);
+    case MAV_CMD_NAV_RETURN_TO_LAUNCH:
+        return handleReturnToLaunch();
+    case MAV_CMD_DO_SET_HOME:
+        return handleSetHome(param1, coordsValid, lat1e7, lon1e7, altCm);
+    case MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN:
+        return handleRebootShutdown(param1);
+    default:
+        return MAV_RESULT_UNSUPPORTED;
+    }
+}
+
+static void handleCommandInt(const mavlink_message_t *msg)
+{
+    mavlink_command_int_t cmd;
+    mavlink_msg_command_int_decode(msg, &cmd);
+
+    if ((cmd.target_system != 0 && cmd.target_system != MAVLINK_SYSTEM_ID) ||
+        (cmd.target_component != 0 && cmd.target_component != MAVLINK_COMPONENT_ID)) {
+        return;
+    }
+
+    const int32_t altCm = isfinite(cmd.z) ? (int32_t)lroundf(cmd.z * 100.0f) : 0;
+    const uint8_t result = mavlinkExecCommand(cmd.command, cmd.param1, cmd.param2,
+        true, cmd.x, cmd.y, altCm);
+    mavlinkSendCommandAck(cmd.command, result, msg->sysid, msg->compid);
+}
+#endif // ENABLE_TELEMETRY_MAVLINK_COMMANDS
+
 static void handleCommandLong(const mavlink_message_t *msg)
 {
     mavlink_command_long_t cmd;
@@ -529,9 +746,28 @@ static void handleCommandLong(const mavlink_message_t *msg)
     case MAV_CMD_SET_MESSAGE_INTERVAL:
         handleSetMessageInterval(&cmd, msg->sysid, msg->compid);
         break;
-    default:
-        mavlinkSendCommandAck(cmd.command, MAV_RESULT_UNSUPPORTED, msg->sysid, msg->compid);
+    default: {
+#if ENABLE_TELEMETRY_MAVLINK_COMMANDS
+        // COMMAND_LONG carries lat/lon as float degrees in param5/param6 (lossy);
+        // COMMAND_INT is preferred for precise coordinates. Only convert when the
+        // command actually consumes coordinates, to avoid UB casting NaN floats.
+        bool coordsValid = false;
+        int32_t lat1e7 = 0, lon1e7 = 0, altCm = 0;
+        if (cmd.command == MAV_CMD_DO_SET_HOME &&
+            isfinite(cmd.param5) && isfinite(cmd.param6) && isfinite(cmd.param7)) {
+            coordsValid = true;
+            lat1e7 = (int32_t)lroundf(cmd.param5 * 1.0e7f);
+            lon1e7 = (int32_t)lroundf(cmd.param6 * 1.0e7f);
+            altCm = (int32_t)lroundf(cmd.param7 * 100.0f);
+        }
+        const uint8_t result = mavlinkExecCommand(cmd.command, cmd.param1, cmd.param2,
+            coordsValid, lat1e7, lon1e7, altCm);
+#else
+        const uint8_t result = MAV_RESULT_UNSUPPORTED;
+#endif
+        mavlinkSendCommandAck(cmd.command, result, msg->sysid, msg->compid);
         break;
+    }
     }
 }
 
@@ -550,6 +786,11 @@ static void mavlinkDispatch(const mavlink_message_t *msg)
     case MAVLINK_MSG_ID_COMMAND_LONG:
         handleCommandLong(msg);
         break;
+#if ENABLE_TELEMETRY_MAVLINK_COMMANDS
+    case MAVLINK_MSG_ID_COMMAND_INT:
+        handleCommandInt(msg);
+        break;
+#endif
     default:
 #if ENABLE_TELEMETRY_MAVLINK_MISSION
         mavMissionHandleMessage(msg);
@@ -572,6 +813,21 @@ static void mavlinkProcessIncoming(void)
             mavlinkDispatch(&mavRxMsg);
         }
     }
+
+#if ENABLE_TELEMETRY_MAVLINK_COMMANDS
+    // Execute a pending reboot only after the COMMAND_ACK has been flushed, so the
+    // GCS sees the acknowledgement before the link drops.
+    if (mavlinkRebootPending) {
+        mavlinkRebootPending = false;
+        waitForSerialPortToFinishTransmitting(mavlinkPort);
+        motorShutdown();
+        if (mavlinkRebootToBootloader) {
+            systemResetToBootloader(BOOTLOADER_REQUEST_ROM);
+        } else {
+            systemReset();
+        }
+    }
+#endif
 }
 
 #ifdef USE_SERIALRX_MAVLINK
@@ -594,23 +850,23 @@ void freeMAVLinkTelemetryPort(void)
 
 void initMAVLinkTelemetry(void)
 {
-    portConfig = findSerialPortConfig(FUNCTION_TELEMETRY_MAVLINK);
-    mavlinkPortSharing = determinePortSharing(portConfig, FUNCTION_TELEMETRY_MAVLINK);
+    telemetryPort = telemetryProviderPort(TELEMETRY_PROTOCOL_MAVLINK);
+    mavlinkPortSharing = determinePortSharing(telemetryPort, FUNCTION_TELEMETRY_MAVLINK);
 }
 
 void configureMAVLinkTelemetryPort(void)
 {
-    if (!portConfig) {
+    if (telemetryPort == SERIAL_PORT_NONE) {
         return;
     }
 
-    baudRate_e baudRateIndex = portConfig->telemetry_baudrateIndex;
+    baudRate_e baudRateIndex = telemetryProviderBaud(TELEMETRY_PROTOCOL_MAVLINK, telemetryPort);
     if (baudRateIndex == BAUD_AUTO) {
         // default rate for minimOSD
         baudRateIndex = BAUD_57600;
     }
 
-    mavlinkPort = openSerialPort(portConfig->identifier, FUNCTION_TELEMETRY_MAVLINK, NULL, NULL, baudRates[baudRateIndex], TELEMETRY_MAVLINK_INITIAL_PORT_MODE, telemetryConfig()->telemetry_inverted ? SERIAL_INVERTED : SERIAL_NOT_INVERTED);
+    mavlinkPort = openSerialPort(telemetryPort, FUNCTION_TELEMETRY_MAVLINK, NULL, NULL, baudRates[baudRateIndex], TELEMETRY_MAVLINK_INITIAL_PORT_MODE, telemetryConfig()->telemetry_inverted ? SERIAL_INVERTED : SERIAL_NOT_INVERTED);
 
     if (!mavlinkPort) {
         return;
@@ -698,7 +954,7 @@ static void mavlinkSendSystemStatus(void)
 
     // Packets transmit counter to debug actual data rate
     static uint32_t transmitCounter = 0;
-    DEBUG_SET(DEBUG_MAVLINK_TELEMETRY, 2, transmitCounter);
+    DEBUG_SET(DEBUG_MAVLINK_TELEMETRY, 2, transmitCounter);  //!< System Status TX Count
     transmitCounter = (transmitCounter + 1) % 100;
 }
 
@@ -711,21 +967,21 @@ static void mavlinkSendRCChannelsAndRSSI(void)
         // port Servo output port (set of 8 outputs = 1 port). Most MAVs will just use one, but this allows to encode more than 8 servos.
         0,
         // chan1_raw RC channel 1 value, in microseconds
-        (rxRuntimeState.channelCount >= 1) ? rcData[0] : 0,
+        (rxRuntimeState.channelCount >= 1) ? rcNormToUs(rcGetChannel(0)) : 0,
         // chan2_raw RC channel 2 value, in microseconds
-        (rxRuntimeState.channelCount >= 2) ? rcData[1] : 0,
+        (rxRuntimeState.channelCount >= 2) ? rcNormToUs(rcGetChannel(1)) : 0,
         // chan3_raw RC channel 3 value, in microseconds
-        (rxRuntimeState.channelCount >= 3) ? rcData[2] : 0,
+        (rxRuntimeState.channelCount >= 3) ? rcNormToUs(rcGetChannel(2)) : 0,
         // chan4_raw RC channel 4 value, in microseconds
-        (rxRuntimeState.channelCount >= 4) ? rcData[3] : 0,
+        (rxRuntimeState.channelCount >= 4) ? rcNormToUs(rcGetChannel(3)) : 0,
         // chan5_raw RC channel 5 value, in microseconds
-        (rxRuntimeState.channelCount >= 5) ? rcData[4] : 0,
+        (rxRuntimeState.channelCount >= 5) ? rcNormToUs(rcGetChannel(4)) : 0,
         // chan6_raw RC channel 6 value, in microseconds
-        (rxRuntimeState.channelCount >= 6) ? rcData[5] : 0,
+        (rxRuntimeState.channelCount >= 6) ? rcNormToUs(rcGetChannel(5)) : 0,
         // chan7_raw RC channel 7 value, in microseconds
-        (rxRuntimeState.channelCount >= 7) ? rcData[6] : 0,
+        (rxRuntimeState.channelCount >= 7) ? rcNormToUs(rcGetChannel(6)) : 0,
         // chan8_raw RC channel 8 value, in microseconds
-        (rxRuntimeState.channelCount >= 8) ? rcData[7] : 0,
+        (rxRuntimeState.channelCount >= 8) ? rcNormToUs(rcGetChannel(7)) : 0,
         // rssi Receive signal strength indicator, 0: 0%, 254: 100%
         scaleRange(getRssi(), 0, RSSI_MAX_VALUE, 0, 254));
     msgLength = mavlink_msg_to_send_buffer(mavBuffer, &mavMsg);
@@ -733,7 +989,7 @@ static void mavlinkSendRCChannelsAndRSSI(void)
 
     // Packets transmit counter to debug actual data rate
     static uint32_t transmitCounter = 0;
-    DEBUG_SET(DEBUG_MAVLINK_TELEMETRY, 3, transmitCounter);
+    DEBUG_SET(DEBUG_MAVLINK_TELEMETRY, 3, transmitCounter);  //!< RC Channels TX Count
     transmitCounter = (transmitCounter + 1) % 100;
 }
 
@@ -797,7 +1053,7 @@ static void mavlinkSendGpsRaw(void)
 
     // Packets transmit counter to debug actual data rate
     static uint32_t transmitCounter = 0;
-    DEBUG_SET(DEBUG_MAVLINK_TELEMETRY, 4, transmitCounter);
+    DEBUG_SET(DEBUG_MAVLINK_TELEMETRY, 4, transmitCounter);  //!< GPS Raw TX Count
     transmitCounter = (transmitCounter + 1) % 100;
 }
 
@@ -903,7 +1159,7 @@ static void mavlinkSendAttitude(void)
 
     // Packets transmit counter to debug actual data rate
     static uint32_t transmitCounter = 0;
-    DEBUG_SET(DEBUG_MAVLINK_TELEMETRY, 5, transmitCounter);
+    DEBUG_SET(DEBUG_MAVLINK_TELEMETRY, 5, transmitCounter);  //!< Attitude TX Count
     transmitCounter = (transmitCounter + 1) % 100;
 }
 
@@ -974,7 +1230,7 @@ static void mavlinkSendHeartbeat(void)
         // type Type of the MAV (quadrotor, helicopter, etc., up to 15 types, defined in MAV_TYPE ENUM)
         mavSystemType,
         // autopilot Autopilot type / class. defined in MAV_AUTOPILOT ENUM
-        MAV_AUTOPILOT_GENERIC,
+        MAV_AUTOPILOT_BETAFLIGHT,
         // base_mode System mode bitfield, see MAV_MODE_FLAGS ENUM in mavlink/include/mavlink_types.h
         mavModes,
         // custom_mode A bitfield for use for autopilot-specific flags.
@@ -986,7 +1242,7 @@ static void mavlinkSendHeartbeat(void)
 
     // Packets transmit counter to debug actual data rate
     static uint32_t transmitCounter = 0;
-    DEBUG_SET(DEBUG_MAVLINK_TELEMETRY, 6, transmitCounter);
+    DEBUG_SET(DEBUG_MAVLINK_TELEMETRY, 6, transmitCounter);  //!< Heartbeat TX Count
     transmitCounter = (transmitCounter + 1) % 100;
 }
 
@@ -1015,7 +1271,7 @@ static void mavlinkSendHUD(void)
         // heading Current heading in degrees, in compass units (0..360, 0=north)
         headingOrScaledMilliAmpereHoursDrawn(),
         // throttle Current throttle setting in integer percent, 0 to 100
-        scaleRange(constrain(rcData[THROTTLE], PWM_RANGE_MIN, PWM_RANGE_MAX), PWM_RANGE_MIN, PWM_RANGE_MAX, 0, 100),
+        scaleRangef(constrainf(rcGetChannel(THROTTLE), NORMALISED_RANGE_MIN, NORMALISED_RANGE_MAX), NORMALISED_RANGE_MIN, NORMALISED_RANGE_MAX, 0, 100),
         // alt Current altitude (MSL), in meters, if we have sonar or baro use them, otherwise use GPS (less accurate)
         mavAltitude,
         // climb Current climb rate in meters/second
@@ -1093,7 +1349,7 @@ static void mavlinkSendBatteryStatus(void)
 
     // Packets transmit counter to debug actual data rate
     static uint32_t transmitCounter = 0;
-    DEBUG_SET(DEBUG_MAVLINK_TELEMETRY, 7, transmitCounter);
+    DEBUG_SET(DEBUG_MAVLINK_TELEMETRY, 7, transmitCounter);  //!< Battery Status TX Count
     transmitCounter = (transmitCounter + 1) % 100;
 }
 
@@ -1280,9 +1536,21 @@ static void processMAVLinkTelemetry(void)
     }
 }
 
+// A MAVLink receiver link is bidirectional, so telemetry rides on the RX port
+// without a provider slot, as CRSF does; a configured provider still wins.
+static bool mavlinkTelemetryOnRxPort(void)
+{
+#ifdef USE_SERIALRX_MAVLINK
+    if (telemetryPort == SERIAL_PORT_NONE && rxRuntimeState.serialrxProvider == SERIALRX_MAVLINK) {
+        return true;
+    }
+#endif
+    return telemetryPort != SERIAL_PORT_NONE && telemetryCheckRxPortShared(telemetryPort, rxRuntimeState.serialrxProvider);
+}
+
 void checkMAVLinkTelemetryState(void)
 {
-    if (portConfig && telemetryCheckRxPortShared(portConfig, rxRuntimeState.serialrxProvider)) {
+    if (mavlinkTelemetryOnRxPort()) {
         if (!mavlinkTelemetryEnabled && telemetrySharedPort != NULL) {
             mavlinkPort = telemetrySharedPort;
             lastArmingDisableFlags = 0;
