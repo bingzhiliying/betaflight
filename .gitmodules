@@ -1,7 +1,7 @@
 [submodule "config"]
 	path = src/config
-	url = https://github.com/betaflight/config.git
-	branch = master
+	url = https://github.com/bingzhiliying/config.git
+	branch = my-config
 	ignore = dirty
 [submodule "lib/modules/pico-sdk"]
 	path = lib/modules/pico-sdk
